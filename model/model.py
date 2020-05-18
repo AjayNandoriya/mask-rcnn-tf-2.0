@@ -6,11 +6,12 @@ from collections import OrderedDict
 
 import numpy as np
 import tensorflow as tf
+# tf.compat.v1.disable_v2_behavior()
 import tensorflow.keras.backend as K
 from tensorflow.keras.layers import Conv2D, Lambda, Input, UpSampling2D, MaxPooling2D, Concatenate, add
 from tensorflow.keras.models import Model
 
-import utils
+import model.utils as utils
 from model.classifier import fpn_classifier_graph
 from data_loader.data_loader import data_generator
 from model.detection import DetectionLayer, DetectionTargetLayer
@@ -18,7 +19,7 @@ from model.loss import rpn_class_loss_graph, mrcnn_class_loss_graph, rpn_bbox_lo
     mrcnn_mask_loss_graph
 from model.proposal import rpn_graph, build_fpn_mask_graph, ProposalLayer
 from model.resnet import resnet_graph
-from utils import parse_image_meta_graph, log, norm_boxes_graph
+from model.utils import parse_image_meta_graph, log, norm_boxes_graph
 
 
 def build_rpn_model(anchor_stride, anchors_per_location, depth):
@@ -39,7 +40,6 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
                               name="input_rpn_feature_map")
     outputs = rpn_graph(input_feature_map, anchors_per_location, anchor_stride)
     return Model([input_feature_map], outputs, name="rpn_model")
-
 
 class MaskRCNN():
     """Encapsulates the Mask RCNN model functionality.
@@ -145,17 +145,6 @@ class MaskRCNN():
         rpn_feature_maps = [P2, P3, P4, P5, P6]
         mrcnn_feature_maps = [P2, P3, P4, P5]
 
-        # Anchors
-        if mode == "training":
-            anchors = self.get_anchors(config.IMAGE_SHAPE)
-            # Duplicate across the batch dimension because Keras requires it
-            # TODO: can this be optimized to avoid duplicating the anchors?
-            anchors = np.broadcast_to(anchors, (config.BATCH_SIZE,) + anchors.shape)
-            # A hack to get around Keras's bad support for constants
-            anchors = Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
-        else:
-            anchors = input_anchors
-
         # RPN Model
         rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE,
                               len(config.RPN_ANCHOR_RATIOS), config.TOP_DOWN_PYRAMID_SIZE)
@@ -183,7 +172,7 @@ class MaskRCNN():
             proposal_count=proposal_count,
             nms_threshold=config.RPN_NMS_THRESHOLD,
             name="ROI",
-            config=config)([rpn_class, rpn_bbox, anchors])
+            config=config)([rpn_class, rpn_bbox])
 
         if mode == "training":
             # Class ID mask to mark class IDs supported by the dataset the image
@@ -319,24 +308,10 @@ class MaskRCNN():
         some layers from loading.
         exclude: list of layer names to exclude
         """
-        import h5py
-        # Conditional import to support versions of Keras before 2.2
-        # TODO: remove in about 6 months (end of 2018)
-
-        from tensorflow.python.keras import saving
-
-        if exclude:
-            by_name = True
-
-        if h5py is None:
-            raise ImportError('`load_weights` requires h5py.')
-        f = h5py.File(filepath, mode='r')
-        if 'layer_names' not in f.attrs and 'model_weights' in f:
-            f = f['model_weights']
-
         # In multi-GPU training, we wrap the model. Get layers
         # of the inner model because they have the weights.
         keras_model = self.keras_model
+
         layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model") \
             else keras_model.layers
 
@@ -344,12 +319,7 @@ class MaskRCNN():
         if exclude:
             layers = filter(lambda l: l.name not in exclude, layers)
 
-        if by_name:
-            saving.load_weights_from_hdf5_group_by_name(f, layers)
-        else:
-            saving.load_weights_from_hdf5_group(f, layers)
-        if hasattr(f, 'close'):
-            f.close()
+        keras_model.load_weights(filepath, layers)
 
         # Update the log directory
         self.set_log_dir(filepath)
@@ -378,19 +348,19 @@ class MaskRCNN():
             clipnorm=self.config.GRADIENT_CLIP_NORM)
         # Add Losses
         # First, clear previously set losses to avoid duplication
-        self.keras_model._losses = []
-        self.keras_model._per_input_losses = {}
+        # self.keras_model._losses = []
+        # self.keras_model._per_input_losses = {}
         loss_names = [
             "rpn_class_loss", "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
+        losses = []
         for name in loss_names:
             layer = self.keras_model.get_layer(name)
             if tf.reduce_any(input_tensor=[layer.output is loss for loss in self.keras_model.losses]):
                 continue
-            loss = (
-                    tf.reduce_mean(input_tensor=layer.output, keepdims=True)
+            losses.append(tf.reduce_mean(input_tensor=layer.output, keepdims=True, name=name +'_mean')
                     * self.config.LOSS_WEIGHTS.get(name, 1.))
-            self.keras_model.add_loss(lambda: loss)
+        self.keras_model.add_loss(lambda: tf.add_n(losses, name='data_loss'))
 
         # Add L2 Regularization
         # Skip gamma and beta weights of batch normalization layers.
@@ -398,23 +368,21 @@ class MaskRCNN():
             tf.keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(input=w), tf.float32)
             for w in self.keras_model.trainable_weights
             if 'gamma' not in w.name and 'beta' not in w.name]
-        self.keras_model.add_loss(lambda: tf.add_n(reg_losses))
+        self.keras_model.add_loss(lambda: tf.add_n(reg_losses, name='regularization_loss'))
+
+        # # Add metrics for losses
+        # for name in loss_names:
+        #     if name in self.keras_model.metrics_names:
+        #         continue
+        #     layer = self.keras_model.get_layer(name)
+        #     self.keras_model.metrics_names.append(name)
+        #     self.keras_model.add_metric(tf.reduce_mean(layer.output, keepdims=True)
+        #             * self.config.LOSS_WEIGHTS.get(name, 1.), name=name)
 
         # Compile
         self.keras_model.compile(
-            optimizer=optimizer,
-            loss=[None] * len(self.keras_model.outputs))
+            optimizer=optimizer)
 
-        # Add metrics for losses
-        for name in loss_names:
-            if name in self.keras_model.metrics_names:
-                continue
-            layer = self.keras_model.get_layer(name)
-            self.keras_model.metrics_names.append(name)
-            loss = (
-                    tf.reduce_mean(layer.output, keepdims=True)
-                    * self.config.LOSS_WEIGHTS.get(name, 1.))
-            self.keras_model.metrics.append(loss)
 
     def set_trainable(self, layer_regex, keras_model=None, indent=0, verbose=1):
         """Sets model layers as trainable if their names match
@@ -577,6 +545,7 @@ class MaskRCNN():
         else:
             workers = multiprocessing.cpu_count()
 
+
         self.keras_model.fit_generator(
             train_generator,
             initial_epoch=self.epoch,
@@ -587,7 +556,7 @@ class MaskRCNN():
             validation_steps=self.config.VALIDATION_STEPS,
             max_queue_size=100,
             workers=workers,
-            use_multiprocessing=True,
+            use_multiprocessing=False,
         )
         self.epoch = max(self.epoch, epochs)
 
@@ -610,7 +579,7 @@ class MaskRCNN():
             # TODO: move resizing to mold_image()
             molded_image, window, scale, padding, crop = utils.resize_image(
                 image,
-                min_dim=self.confMIN_DIM,
+                min_dim=self.config.IMAGE_MIN_DIM,
                 min_scale=self.config.IMAGE_MIN_SCALE,
                 max_dim=self.config.IMAGE_MAX_DIM,
                 mode=self.config.IMAGE_RESIZE_MODE)
@@ -812,7 +781,7 @@ class MaskRCNN():
             self._anchor_cache = {}
         if not tuple(image_shape) in self._anchor_cache:
             # Generate Anchors
-            a = utils.generate_pyramid_anchors(
+            a, anchors_shape = utils.generate_pyramid_anchors(
                 self.config.RPN_ANCHOR_SCALES,
                 self.config.RPN_ANCHOR_RATIOS,
                 backbone_shapes,
