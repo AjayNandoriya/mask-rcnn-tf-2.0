@@ -1,7 +1,7 @@
 import tensorflow as tf
 import tensorflow.keras.backend as K
 
-from utils import batch_pack_graph
+from model.utils import batch_pack_graph
 
 
 def smooth_l1_loss(y_true, y_pred):
