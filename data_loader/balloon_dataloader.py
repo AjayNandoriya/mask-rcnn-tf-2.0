@@ -1,4 +1,4 @@
-import utils
+from model import utils
 import json
 import os
 import skimage

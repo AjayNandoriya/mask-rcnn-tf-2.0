@@ -4,7 +4,7 @@ import random
 import numpy as np
 import skimage.io
 
-import utils
+from model import utils
 
 
 class Dataset(object):
