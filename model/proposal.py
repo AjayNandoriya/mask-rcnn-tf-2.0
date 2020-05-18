@@ -2,9 +2,9 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import BatchNormalization, Conv2D, Activation, Lambda, TimeDistributed, Conv2DTranspose
 
-import utils
+import model.utils as utils
 from model.modules import apply_box_deltas_graph, clip_boxes_graph
-from utils import parse_image_meta_graph, log2_graph
+from model.utils import parse_image_meta_graph, log2_graph
 
 
 class ProposalLayer(tf.keras.layers.Layer):
@@ -25,6 +25,12 @@ class ProposalLayer(tf.keras.layers.Layer):
         self.config = config
         self.proposal_count = proposal_count
         self.nms_threshold = nms_threshold
+        self.anchors = utils.get_anchors(config)
+
+    def get_config(self):
+        config = super(ProposalLayer, self).get_config()
+        config.update({'proposal_count': self.proposal_count, 'nms_threshold': self.nms_threshold})
+        return config
 
     def call(self, inputs):
         # Box Scores. Use the foreground class confidence. [Batch, num_rois, 1]
@@ -33,18 +39,18 @@ class ProposalLayer(tf.keras.layers.Layer):
         deltas = inputs[1]
         deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV, [1, 1, 4])
         # Anchors
-        anchors = inputs[2]
+        # anchors = inputs[2]
 
         # Improve performance by trimming to top anchors by score
         # and doing the rest on the smaller subset.
-        pre_nms_limit = tf.minimum(self.config.PRE_NMS_LIMIT, tf.shape(anchors)[1])
+        pre_nms_limit = tf.minimum(self.config.PRE_NMS_LIMIT, self.anchors.shape[1])
         ix = tf.nn.top_k(scores, pre_nms_limit, sorted=True,
                          name="top_anchors").indices
         scores = utils.batch_slice([scores, ix], lambda x, y: tf.gather(x, y),
                                    self.config.IMAGES_PER_GPU)
         deltas = utils.batch_slice([deltas, ix], lambda x, y: tf.gather(x, y),
                                    self.config.IMAGES_PER_GPU)
-        pre_nms_anchors = utils.batch_slice([anchors, ix], lambda a, x: tf.gather(a, x),
+        pre_nms_anchors = utils.batch_slice([self.anchors, ix], lambda a, x: tf.gather(a, x),
                                             self.config.IMAGES_PER_GPU,
                                             names=["pre_nms_anchors"])
 
@@ -107,6 +113,11 @@ class PyramidROIAlign(tf.keras.layers.Layer):
         super(PyramidROIAlign, self).__init__(**kwargs)
         self.pool_shape = tuple(pool_shape)
 
+    def get_config(self):
+        config = super(PyramidROIAlign, self).get_config()
+        config.update({'pool_shape': self.pool_shape})
+        return config
+
     def call(self, inputs):
         # Crop boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
         boxes = inputs[0]
@@ -148,8 +159,8 @@ class PyramidROIAlign(tf.keras.layers.Layer):
             box_to_level.append(ix)
 
             # Stop gradient propogation to ROI proposals
-            level_boxes = tf.stop_gradient(level_boxes)
-            box_indices = tf.stop_gradient(box_indices)
+            level_boxes = tf.compat.v1.stop_gradient(level_boxes)
+            box_indices = tf.compat.v1.stop_gradient(box_indices)
 
             # Crop and Resize
             # From Mask R-CNN paper: "We sample four regular locations, so
