@@ -634,7 +634,7 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
     # Anchors
     # [anchor_count, (y1, x1, y2, x2)]
     backbone_shapes = utils.compute_backbone_shapes(config, config.IMAGE_SHAPE)
-    anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
+    anchors, anchors_shape = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                              config.RPN_ANCHOR_RATIOS,
                                              backbone_shapes,
                                              config.BACKBONE_STRIDES,
